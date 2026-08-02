@@ -31,6 +31,18 @@ jobs:
           - x64
     steps:
       - uses: actions/checkout@v6
+      # BinaryBuilder (used to build bindings/) relies on Pkg.Registry
+      # internals that can lag behind Julia nightly/'pre' -- build the JLL
+      # with a known-stable Julia regardless of which version this matrix
+      # leg tests RocksDB.jl itself under. Placed before the matrix's own
+      # setup-julia step below so that step's PATH changes win for
+      # everything after it.
+      - name: Set up a stable Julia for building bindings/
+        id: setup-julia-stable
+        uses: julia-actions/setup-julia@v3
+        with:
+          version: '1.10'
+          arch: ${{ matrix.arch }}
       - uses: julia-actions/setup-julia@v3
         with:
           version: ${{ matrix.version }}
@@ -45,8 +57,9 @@ jobs:
       # builds and tests against -- see bindings/README.md.
       - name: Build local RocksDB_jll from bindings/
         run: |
-          julia --project=bindings -e 'import Pkg; Pkg.instantiate()'
-          julia --project=bindings bindings/build_tarballs.jl --verbose --deploy=local x86_64-linux-gnu-cxx11
+          STABLE_JULIA="${{ steps.setup-julia-stable.outputs.julia-bindir }}/julia"
+          "$STABLE_JULIA" --project=bindings -e 'import Pkg; Pkg.instantiate()'
+          "$STABLE_JULIA" --project=bindings bindings/build_tarballs.jl --verbose --deploy=local x86_64-linux-gnu-cxx11
           julia --project=. -e 'import Pkg; Pkg.develop(path=joinpath(homedir(), ".julia", "dev", "RocksDB_jll"))'
       - uses: julia-actions/julia-buildpkg@v1
       - uses: julia-actions/julia-runtest@v1
