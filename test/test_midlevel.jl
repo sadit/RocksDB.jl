@@ -37,6 +37,24 @@
         end
     end
 
+    @testset "batch do-block" begin
+        path = joinpath(dir, "db_batch_do")
+        RocksDB.opendb(path) do db
+            RocksDB.batch(db) do wb
+                put!(wb, "a", "1")
+                put!(wb, "b", "2")
+            end
+            @test String(get(db, "a")) == "1"
+            @test String(get(db, "b")) == "2"
+
+            @test_throws ErrorException RocksDB.batch(db) do wb
+                put!(wb, "c", "3")
+                error("boom")
+            end
+            @test get(db, "c") === nothing  # discarded, not partially applied
+        end
+    end
+
     @testset "iteration is in sorted key order" begin
         path = joinpath(dir, "db_iter")
         RocksDB.opendb(path) do db
@@ -85,6 +103,31 @@
             ro = RocksDB.ReadOptions(; snapshot = snap)
             @test String(get(db, "k"; options = ro)) == "before"
             @test String(get(db, "k")) == "after"
+        end
+    end
+
+    @testset "Snapshot do-block" begin
+        path = joinpath(dir, "db_snap_do")
+        RocksDB.opendb(path) do db
+            put!(db, "k", "before")
+            captured = nothing
+            result = RocksDB.Snapshot(db) do snap
+                captured = snap
+                put!(db, "k", "after")
+                ro = RocksDB.ReadOptions(; snapshot = snap)
+                String(get(db, "k"; options = ro))
+            end
+            @test result == "before"
+            @test String(get(db, "k")) == "after"
+            @test captured.ptr == C_NULL  # released automatically
+
+            # released even when the block throws
+            captured2 = nothing
+            @test_throws ErrorException RocksDB.Snapshot(db) do snap
+                captured2 = snap
+                error("boom")
+            end
+            @test captured2.ptr == C_NULL
         end
     end
 

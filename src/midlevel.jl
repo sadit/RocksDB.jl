@@ -650,6 +650,10 @@ get(db, "a")                # nothing
 empty!(wb)                  # reuse the same batch for a second round of writes
 close(db)
 ```
+
+`batch(f, db)` (documented below, alongside `write!`) is a `do`-block
+convenience that creates the batch, runs `f` on it, and commits with
+`write!` automatically (only if `f` returns normally).
 """
 mutable struct WriteBatch
     ptr::Ptr{Lib.rocksdb_writebatch_t}
@@ -716,6 +720,32 @@ Atomically apply `batch` to `db`.
 """
 function write!(db::DB, batch::WriteBatch; options::WriteOptions = db.default_write_options)
     checked(errptr -> Lib.rocksdb_write(db.ptr, options.ptr, batch.ptr, errptr))
+    return db
+end
+
+"""
+    batch(f, db::DB; options=db.default_write_options)
+
+`do`-block convenience: create a [`WriteBatch`](@ref), run `f` on it, and
+`write!` it to `db` -- only if `f` returns normally. If `f` throws, the
+batch is discarded and nothing is written (same all-or-nothing guarantee
+as building a `WriteBatch` by hand). The [`RocksDBDict`](@ref) equivalent
+is `RocksDB.batch(f, dict)`.
+
+```julia
+db = RocksDB.opendb("mydb")
+RocksDB.batch(db) do wb
+    put!(wb, "a", "1")
+    put!(wb, "b", "2")
+end
+String(get(db, "a"))   # "1"
+close(db)
+```
+"""
+function batch(f, db::DB; options::WriteOptions = db.default_write_options)
+    wb = WriteBatch()
+    f(wb)
+    write!(db, wb; options)
     return db
 end
 
@@ -877,6 +907,8 @@ Base.eltype(::Type{DBIterator}) = Tuple{Vector{UInt8},Vector{UInt8}}
 """
     Snapshot(db)
 
+    Snapshot(f, db)
+
 A consistent point-in-time read view. Release it (or let the finalizer do
 so) when done; pass it to [`ReadOptions`](@ref)`(; snapshot=...)` for
 reads that should be unaffected by writes made after the snapshot.
@@ -892,6 +924,20 @@ put!(db, "k", "after")
 String(get(db, "k"; options = RocksDB.ReadOptions(; snapshot = snap)))   # "before"
 close(db)
 ```
+
+The `do`-block form releases the snapshot automatically, even if the
+block throws:
+
+```julia
+db = RocksDB.opendb("mydb2")
+put!(db, "k", "before")
+RocksDB.Snapshot(db) do snap
+    put!(db, "k", "after")
+    ro = RocksDB.ReadOptions(; snapshot = snap)
+    String(get(db, "k"; options = ro))   # "before"
+end
+close(db)
+```
 """
 function Snapshot(db::DB)
     ptr = Lib.rocksdb_create_snapshot(db.ptr)
@@ -904,6 +950,15 @@ function Snapshot(db::DB)
     end
     push!(db.children, WeakRef(snap))
     return snap
+end
+
+function Snapshot(f::Function, db::DB)
+    snap = Snapshot(db)
+    try
+        return f(snap)
+    finally
+        finalize(snap)
+    end
 end
 
 # ------------------------------------------------------------------------

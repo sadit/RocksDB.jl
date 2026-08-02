@@ -50,6 +50,7 @@ put!(::WriteBatch, ::Any, ::Any)
 delete!(::WriteBatch, ::Any)
 empty!(::WriteBatch)
 write!
+batch(::Function, ::DB)
 ```
 
 ## Iteration

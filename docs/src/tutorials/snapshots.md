@@ -31,6 +31,24 @@ A [`DBIterator`](@ref) built with the same `options` scans the
 snapshot's view too, so a whole report/scan can be made
 point-in-time-consistent, not just single reads.
 
+`Snapshot(db) do snap ... end` releases the snapshot automatically
+(even if the block throws), instead of you having to remember to do it:
+
+```julia
+using RocksDB
+
+db2 = opendb(mktempdir() * "/snapdb2")
+put!(db2, "balance", "100")
+
+report = Snapshot(db2) do snap
+    put!(db2, "balance", "150")   # a concurrent write, while the report runs
+    ro = ReadOptions(; snapshot = snap)
+    String(get(db2, "balance"; options = ro))
+end
+println(report)   # "100" -- unaffected by the concurrent write above
+close(db2)
+```
+
 ## Tier 3: `RocksDB.snapshot` and `RocksDBSnapshotView`
 
 ```julia
@@ -53,6 +71,23 @@ view["balance"] = "nope"   # errors: RocksDBSnapshotView is read-only
 close(view)                # releases only the snapshot
 d["still"] = "works"        # d itself is completely unaffected by closing the view
 close(d)
+```
+
+`RocksDB.snapshot(d) do view ... end` releases the view automatically,
+the same way `Snapshot(db) do snap ... end` does at Tier 2:
+
+```julia
+using RocksDB
+
+d2 = RocksDBDict{String,String}(mktempdir() * "/snapdict2")
+d2["balance"] = "100"
+
+report = RocksDB.snapshot(d2) do view
+    d2["balance"] = "150"
+    view["balance"]
+end
+println(report)   # "100"
+close(d2)
 ```
 
 ## Two things a snapshot does *not* freeze

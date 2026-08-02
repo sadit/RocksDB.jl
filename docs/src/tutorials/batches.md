@@ -24,6 +24,22 @@ close(db)
 Reuse a batch across multiple rounds of writes with `empty!(wb)` instead
 of allocating a new one each time.
 
+`RocksDB.batch(db) do wb ... end` is a `do`-block shortcut for the same
+thing: it creates the batch, runs the block, and calls `write!` for you
+automatically -- only if the block returns normally:
+
+```julia
+using RocksDB
+
+db = opendb(mktempdir() * "/batchdb2")
+RocksDB.batch(db) do wb
+    put!(wb, "a", "1")
+    put!(wb, "b", "2")
+end   # write! called here, automatically
+String(get(db, "a"))   # "1"
+close(db)
+```
+
 ## Tier 3: `RocksDB.batch`
 
 ```julia
@@ -40,8 +56,9 @@ close(d)
 
 ## Rollback on exception
 
-If the block passed to `RocksDB.batch` throws, nothing staged in it is
-written -- the exception simply propagates, and `write!` is never called:
+If the block passed to `RocksDB.batch` throws (at either tier), nothing
+staged in it is written -- the exception simply propagates, and `write!`
+is never called:
 
 ```julia
 using RocksDB
@@ -59,6 +76,7 @@ haskey(d, "z")   # false -- the batch was discarded, not partially applied
 close(d)
 ```
 
-The Tier 2 equivalent is just as simple: don't call `write!` if you decide
-not to commit (e.g. inside a `try`/`catch`) -- an un-written `WriteBatch`
-has no effect on the database at all.
+Building a `WriteBatch` by hand (rather than through the `do`-block form)
+gives you the same guarantee just as easily: don't call `write!` if you
+decide not to commit (e.g. inside a `try`/`catch`) -- an un-written
+`WriteBatch` has no effect on the database at all.

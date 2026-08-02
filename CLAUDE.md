@@ -93,6 +93,12 @@ update this note.
    called `finalize` on them explicitly. Follow this pattern for any new
    finalizer.
 
+   `Snapshot(f, db)` and `batch(f, db::DB)` are `do`-block conveniences
+   (the latter mirrors Tier 3's `RocksDB.batch(f, dict)`, just operating
+   directly on a `DB`): `Snapshot` auto-releases via `finalize` in a
+   `finally`, `batch` auto-`write!`s only if the block returns normally.
+   Both are additive methods on existing exported names, not new exports.
+
 3. **Tier 3 -- `src/dict.jl`**. `RocksDBDict{K,V} <: AbstractDict{K,V}`.
    Byte/string K/V pass through untouched; anything else goes through
    `Serialization.serialize`/`deserialize` so `RocksDBDict{Any,Any}` (the
