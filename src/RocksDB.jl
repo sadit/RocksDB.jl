@@ -16,7 +16,7 @@ include("dict.jl")
 export opendb, Options, DB, WriteBatch, WriteOptions, ReadOptions, DBIterator, Snapshot,
        Env, Cache, FilterPolicy, ColumnFamily, RocksDBException,
        put!, write!, create_column_family, column_families, property,
-       seek_to_first!, seek_to_last!, seek!, valid, key, value,
-       RocksDBDict, batch, ColumnFamilies
+       seek_to_first!, seek_to_last!, seek!, advance!, valid, key, value,
+       RocksDBDict, batch, ColumnFamilies, RocksDBSnapshotView, snapshot
 
 end

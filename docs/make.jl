@@ -5,6 +5,8 @@ DocMeta.setdocmeta!(RocksDB, :DocTestSetup, :(using RocksDB); recursive=true)
 
 makedocs(;
     modules=[RocksDB],
+    checkdocs=:all,
+    checkdocs_ignored_modules=[RocksDB.LibRocksDB],
     authors="Eric S. Tellez <donsadit@gmail.com>",
     sitename="RocksDB.jl",
     format=Documenter.HTML(;
@@ -14,6 +16,19 @@ makedocs(;
     ),
     pages=[
         "Home" => "index.md",
+        "Tutorials" => [
+            "tutorials/getting_started.md",
+            "tutorials/compression.md",
+            "tutorials/iteration.md",
+            "tutorials/batches.md",
+            "tutorials/column_families.md",
+            "tutorials/snapshots.md",
+            "tutorials/mixing_tiers.md",
+        ],
+        "API Reference" => [
+            "Tier 2" => "reference/tier2.md",
+            "Tier 3" => "reference/tier3.md",
+        ],
     ],
 )
 

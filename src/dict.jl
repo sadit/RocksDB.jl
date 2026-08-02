@@ -37,9 +37,26 @@ mutable struct RocksDBDict{K,V} <: AbstractDict{K,V}
         return new{K,V}(db, String(column_family))
     end
 
-    # Wrap an already-open DB (and one of its column families) without
-    # opening a new connection -- the building block `ColumnFamilies` uses
-    # to hand out per-column-family dicts that share one underlying DB.
+    """
+        RocksDBDict{K,V}(db::DB, column_family::AbstractString)
+
+    Wrap an *already-open* [`DB`](@ref) (and one of its column families) as
+    a `RocksDBDict`, instead of opening a new connection. This is the
+    supported way to bridge Tier 2 to Tier 3: open a `DB` yourself via
+    [`opendb`](@ref) for anything the `RocksDBDict{K,V}(path; kwargs...)`
+    constructor doesn't expose (`read_only=true`, a shared/custom `Env`,
+    several column families opened together, ...), then get convenient
+    dict-style access to it with this constructor. [`ColumnFamilies`](@ref)
+    is built entirely out of this constructor, one call per column family.
+
+    ```julia
+    db = RocksDB.opendb("mydb"; read_only = true, column_families = ["default", "users"])
+    users = RocksDB.RocksDBDict{String,String}(db, "users")
+    users["alice"]              # read normally through the dict API
+    # users["alice"] = "x"      # would throw: db was opened read_only
+    close(db)                   # closes db -- `users` shares its connection, not a separate one
+    ```
+    """
     RocksDBDict{K,V}(db::DB, column_family::AbstractString) where {K,V} = new{K,V}(db, String(column_family))
 end
 
@@ -112,7 +129,7 @@ flushed data). For an exact count, `count(Returns(true), d)` (which
 actually iterates) is available like for any other `AbstractDict`.
 """
 function Base.length(d::RocksDBDict)
-    s = property(d.db, "rocksdb.estimate-num-keys")
+    s = property(d.db, "rocksdb.estimate-num-keys"; cf = _cf_arg(d))
     return s === nothing ? 0 : parse(Int, s)
 end
 
@@ -242,3 +259,121 @@ function create_column_family(s::ColumnFamilies{K,V}, name::Union{AbstractString
     s.dicts[n] = d
     return d
 end
+
+# ------------------------------------------------------------------------
+# RocksDBSnapshotView: a read-only view of a RocksDBDict pinned to a
+# point-in-time snapshot, so reads/iteration are unaffected by writes made
+# after the snapshot was taken. Purely additive on top of RocksDBDict's own
+# methods (see `RocksDB.snapshot` below) -- no existing method signatures
+# change.
+# ------------------------------------------------------------------------
+
+"""
+    RocksDBSnapshotView{K,V}
+
+A read-only `AbstractDict{K,V}` view of a [`RocksDBDict`](@ref)'s column
+family, pinned to a point-in-time [`Snapshot`](@ref): writes made to the
+underlying dict *after* the view was created are invisible to it, both via
+indexing and iteration. Construct with [`snapshot`](@ref); writing to a
+view (`setindex!`, `delete!`, `empty!`) throws.
+
+`length` is **not** point-in-time consistent -- RocksDB's
+`"rocksdb.estimate-num-keys"` property has no snapshot/`ReadOptions`
+parameter in the C API, so it always reflects the live database, unlike
+`getindex`/`haskey`/iteration on the same view.
+
+`close(view)` releases only the snapshot (and its `ReadOptions`), **not**
+the shared underlying `DB` -- that connection is owned by whichever
+`RocksDBDict`/`ColumnFamilies` it came from and keeps working after the
+view is closed.
+"""
+mutable struct RocksDBSnapshotView{K,V} <: AbstractDict{K,V}
+    db::DB
+    cf::String
+    snapshot::Snapshot
+    read_options::ReadOptions
+end
+
+_cf_arg(v::RocksDBSnapshotView) = v.cf == "default" ? nothing : v.cf
+_encode_key(v::RocksDBSnapshotView{K}, k::K) where {K} = _encode(K, k)
+
+"""
+    snapshot(d::RocksDBDict) -> RocksDBSnapshotView
+    snapshot(f, d::RocksDBDict)
+
+Create a [`RocksDBSnapshotView`](@ref) of `d`'s column family as it is
+right now. The do-block form releases the snapshot automatically (even if
+`f` throws); otherwise release it with `close(view)` when done.
+
+```julia
+view = RocksDB.snapshot(d)
+d["k"] = "changed after the snapshot"
+view["k"]   # still the pre-snapshot value (or a KeyError if it didn't exist yet)
+close(view)
+```
+"""
+function snapshot(d::RocksDBDict{K,V}) where {K,V}
+    snap = Snapshot(d.db)
+    ro = ReadOptions(; snapshot = snap)
+    return RocksDBSnapshotView{K,V}(d.db, d.cf, snap, ro)
+end
+
+function snapshot(f, d::RocksDBDict)
+    view = snapshot(d)
+    try
+        return f(view)
+    finally
+        close(view)
+    end
+end
+
+Base.close(v::RocksDBSnapshotView) = (finalize(v.read_options); finalize(v.snapshot); nothing)
+Base.isopen(v::RocksDBSnapshotView) = v.snapshot.ptr != C_NULL
+
+function Base.getindex(v::RocksDBSnapshotView{K,V}, k) where {K,V}
+    raw = get(v.db, _encode_key(v, convert(K, k)); cf = _cf_arg(v), options = v.read_options)
+    raw === nothing && throw(KeyError(k))
+    return _decode(V, raw)
+end
+
+function Base.get(v::RocksDBSnapshotView{K,V}, k, default) where {K,V}
+    raw = get(v.db, _encode_key(v, convert(K, k)); cf = _cf_arg(v), options = v.read_options)
+    raw === nothing && return default
+    return _decode(V, raw)
+end
+
+function Base.get(f::Union{Function,Type}, v::RocksDBSnapshotView{K,V}, k) where {K,V}
+    raw = get(v.db, _encode_key(v, convert(K, k)); cf = _cf_arg(v), options = v.read_options)
+    raw === nothing && return f()
+    return _decode(V, raw)
+end
+
+Base.haskey(v::RocksDBSnapshotView{K}, k) where {K} =
+    get(v.db, _encode_key(v, convert(K, k)); cf = _cf_arg(v), options = v.read_options) !== nothing
+
+"""
+    length(v::RocksDBSnapshotView)
+
+**Not** point-in-time consistent -- see [`RocksDBSnapshotView`](@ref).
+"""
+function Base.length(v::RocksDBSnapshotView)
+    s = property(v.db, "rocksdb.estimate-num-keys"; cf = _cf_arg(v))
+    return s === nothing ? 0 : parse(Int, s)
+end
+Base.IteratorSize(::Type{<:RocksDBSnapshotView}) = Base.SizeUnknown()
+Base.isempty(v::RocksDBSnapshotView) = iterate(v) === nothing
+
+function Base.iterate(v::RocksDBSnapshotView{K,V}, state = nothing) where {K,V}
+    it = state === nothing ? DBIterator(v.db; cf = _cf_arg(v), options = v.read_options) : state
+    r = iterate(it, state === nothing ? nothing : true)
+    r === nothing && return nothing
+    (kraw, vraw), _ = r
+    return (_decode(K, kraw) => _decode(V, vraw)), it
+end
+
+Base.setindex!(::RocksDBSnapshotView, _v, _k) =
+    error("RocksDBSnapshotView is read-only (backed by a point-in-time snapshot)")
+Base.delete!(::RocksDBSnapshotView, _k) =
+    error("RocksDBSnapshotView is read-only (backed by a point-in-time snapshot)")
+Base.empty!(::RocksDBSnapshotView) =
+    error("RocksDBSnapshotView is read-only (backed by a point-in-time snapshot)")

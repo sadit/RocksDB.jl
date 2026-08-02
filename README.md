@@ -20,10 +20,11 @@ The package exposes RocksDB at three levels:
 2. **Mid-level API** (`RocksDB.opendb`, `RocksDB.DB`, `put!`, `get`,
    `delete!`, `RocksDB.WriteBatch`, `RocksDB.DBIterator`, ...) -- idiomatic
    Julia wrappers with sensible defaults, for everyday use.
-3. **`RocksDBDict`** and **`RocksDB.ColumnFamilies`** -- an `AbstractDict`-like
-   facade with compression and cache/environment knobs surfaced directly in
-   its constructor, atomic batch writes, and column families as dict-like
-   sub-namespaces.
+3. **`RocksDBDict`**, **`RocksDB.ColumnFamilies`**, and
+   **`RocksDB.RocksDBSnapshotView`** -- an `AbstractDict`-like facade with
+   compression and cache/environment knobs surfaced directly in its
+   constructor, atomic batch writes, column families as dict-like
+   sub-namespaces, and read-only point-in-time snapshot views.
 
 ## Installation
 
@@ -94,6 +95,33 @@ new_cf["l1"] = "started"
 
 close(store)   # closes the shared DB and every RocksDBDict handed out
 ```
+
+### Tier 3: point-in-time snapshot views
+
+```julia
+using RocksDB
+
+d = RocksDBDict{String,String}("mydb4")
+d["k1"] = "before"
+
+view = RocksDB.snapshot(d)   # or: RocksDB.snapshot(d) do view ... end
+d["k1"] = "after"
+d["k2"] = "added after the snapshot"
+
+view["k1"]            # "before" -- unaffected by writes made after the snapshot
+haskey(view, "k2")     # false
+collect(view)          # only ["k1" => "before"]
+
+view["k1"] = "nope"    # errors: RocksDBSnapshotView is read-only
+
+close(view)            # releases only the snapshot -- `d` (and its underlying
+                        # connection) keeps working normally afterward
+d["k3"] = "still fine"
+```
+
+Note: `length(view)` is **not** point-in-time consistent (RocksDB's
+key-count estimate has no snapshot parameter in the C API) -- only
+indexing and iteration are.
 
 ### Tier 1: escape hatch
 

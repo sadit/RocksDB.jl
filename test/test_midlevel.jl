@@ -60,6 +60,22 @@
         end
     end
 
+    @testset "property is column-family-scoped" begin
+        # Regression test: property(db, name) and RocksDBDict/RocksDBSnapshotView's
+        # length() used to always report the *default* column family's value,
+        # even when scoped to a different one.
+        path = joinpath(dir, "db_prop_cf")
+        RocksDB.opendb(path) do db
+            cf = create_column_family(db, "other")
+            put!(db, "k1", "v1")
+            put!(db, "k2", "v2"; cf = cf)
+            @test property(db, "rocksdb.estimate-num-keys") == "1"
+            @test property(db, "rocksdb.estimate-num-keys"; cf = cf) == "1"
+            @test property(db, "rocksdb.estimate-num-keys"; cf = "other") == "1"
+            @test property(db, "rocksdb.no-such-property") === nothing
+        end
+    end
+
     @testset "snapshot" begin
         path = joinpath(dir, "db_snap")
         RocksDB.opendb(path) do db

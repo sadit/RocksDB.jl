@@ -8,3 +8,10 @@
 # Editor/preview-generated rendering artifacts, not source
 /README.html
 /README_files/
+
+# Personal Claude Code overrides, not shared with the team
+/.claude/settings.local.json
+
+# RocksDB data directories created by running README/tutorial examples
+# verbatim from the repo root instead of a temp dir
+/mydb*/

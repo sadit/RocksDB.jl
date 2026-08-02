@@ -36,6 +36,18 @@ jobs:
           version: ${{ matrix.version }}
           arch: ${{ matrix.arch }}
       - uses: julia-actions/cache@v2
+      # RocksDB_jll's UUID is deterministic (BinaryBuilder derives it from the
+      # package name), and an *older*, less complete RocksDB_jll (missing
+      # bzip2/liburing, built against an older RocksDB with a different C API
+      # surface) is already registered upstream under that same UUID. Without
+      # this step, a fresh `Pkg.instantiate()` would silently resolve to that
+      # upstream version instead of the one this repo's bindings/ actually
+      # builds and tests against -- see bindings/README.md.
+      - name: Build local RocksDB_jll from bindings/
+        run: |
+          julia --project=bindings -e 'import Pkg; Pkg.instantiate()'
+          julia --project=bindings bindings/build_tarballs.jl --verbose --deploy=local x86_64-linux-gnu-cxx11
+          julia --project=. -e 'import Pkg; Pkg.develop(path=joinpath(homedir(), ".julia", "dev", "RocksDB_jll"))'
       - uses: julia-actions/julia-buildpkg@v1
       - uses: julia-actions/julia-runtest@v1
       - uses: julia-actions/julia-processcoverage@v1

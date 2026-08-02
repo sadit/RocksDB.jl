@@ -77,6 +77,22 @@ update this note.
    pattern become `RocksDBException`. Defaults: `create_if_missing=true`,
    zstd compression, 10-bits-per-key bloom filter, 8 MiB block cache.
 
+   Every finalizer (`Cache`, `FilterPolicy`, `Env`, `Options`,
+   `WriteOptions`, `ReadOptions`, `WriteBatch`, `DBIterator`, `Snapshot`)
+   resets its `.ptr` field to `C_NULL` *after* calling the matching
+   `rocksdb_*_destroy`/`_release_*` function, not just before (i.e. the
+   guard is `if ptr != C_NULL; destroy(ptr); ptr = C_NULL; end`, not a
+   one-shot `ptr != C_NULL && destroy(ptr)`). This was a real bug found
+   while building `RocksDBSnapshotView`: calling `Base.finalize(x)`
+   explicitly (as `close` on a snapshot view needs to, to release
+   deterministically rather than wait for GC) would call the destroy
+   function but never mark the object as released, so a later `isopen`
+   check (or a second `finalize`) would see a stale non-null pointer --
+   at best wrong, at worst a double free/release. `DB._close!` already had
+   the correct pattern; the rest didn't, because nothing had previously
+   called `finalize` on them explicitly. Follow this pattern for any new
+   finalizer.
+
 3. **Tier 3 -- `src/dict.jl`**. `RocksDBDict{K,V} <: AbstractDict{K,V}`.
    Byte/string K/V pass through untouched; anything else goes through
    `Serialization.serialize`/`deserialize` so `RocksDBDict{Any,Any}` (the
@@ -90,6 +106,19 @@ update this note.
    were bugs caught by manual testing (`collect` raising "destination has
    fewer elements than required" right after a couple of small writes,
    since RocksDB's estimate can undercount fresh, unflushed data).
+
+   `property(db, name)` (Tier 2) and `length` on `RocksDBDict`/
+   `RocksDBSnapshotView` (Tier 3) used to always query RocksDB's
+   **default** column family, even when scoped to a different one --
+   RocksDB tracks most properties per column family, and
+   `rocksdb_property_value` (no `cf`) vs `rocksdb_property_value_cf`
+   (Tier 1) are genuinely different calls. Found while writing the
+   "mixing tiers" tutorial (`length(store["users"])` silently reported
+   the `"default"` column family's count instead of `"users"`'s). Fixed
+   by adding a `cf` keyword to `property` and threading `_cf_arg(d)`
+   through both `length` methods; see the regression tests added
+   alongside ("property is column-family-scoped" in `test_midlevel.jl`,
+   "RocksDBDict length() is column-family-scoped" in `test_dict.jl`).
 
    `RocksDB.ColumnFamilies{K,V}` is the column-family-as-sub-namespace API
    (four UX options were sketched for the user, who picked this one): a
@@ -106,10 +135,30 @@ update this note.
    that don't exist yet otherwise errors (`Column family not found`, a
    real RocksDB requirement, not a bug).
 
+   `RocksDB.RocksDBSnapshotView{K,V}` is the read-only, point-in-time
+   snapshot view: `RocksDB.snapshot(d::RocksDBDict)` (also has a do-block
+   form) wraps Tier 2's existing `Snapshot`/`ReadOptions(; snapshot=...)`
+   -- no new C-binding-level work was needed. It's purely additive next to
+   `RocksDBDict` (a separate struct with its own near-identical
+   `getindex`/`get`/`haskey`/`iterate` methods, each just passing a
+   snapshot-bound `ReadOptions` instead of the DB's default) rather than a
+   shared abstract supertype, to avoid touching `RocksDBDict`'s already
+   -tested methods for the sake of ~25 lines of de-duplication. Two
+   documented limitations: `length(view)` is **not** point-in-time
+   consistent (RocksDB's key-count estimate has no snapshot parameter in
+   the C API), and `close(view)` releases only the snapshot, deliberately
+   **not** the shared `DB` (unlike `close(d::RocksDBDict)`, which does
+   close the whole connection) -- closing a view must never affect
+   whoever else is still using that `DB`. Writes through a view
+   (`setindex!`/`delete!`/`empty!`) throw a clear `ErrorException` rather
+   than a generic `MethodError`.
+
 ## Suggested follow-ups (not yet implemented)
 
-- Snapshot-backed read-only `RocksDBDict` view for consistent point-in-time
-  iteration.
+- `ColumnFamily` handles (`src/midlevel.jl`) are never destroyed --
+  `rocksdb_column_family_handle_destroy` has no caller anywhere. Found
+  while auditing finalizers for the snapshot-view work; a real (small)
+  resource leak, out of scope for that change.
 - TBB/NUMA/sanitizer build variants in `bindings/`, if ever needed.
 
 ## Testing
@@ -119,3 +168,54 @@ update this note.
   `julia --project=. -e 'using Pkg; Pkg.test()'`.
 - Tests require the locally-built `RocksDB_jll` (see above) to be
   `Pkg.develop`-ed into this environment first.
+- `.github/workflows/CI.yml`'s `test` job does the same build+dev step
+  before running `Pkg.test()`, for the same reason: `RocksDB_jll`'s UUID
+  is deterministic, and an older, less complete version (missing
+  bzip2/liburing) is already registered upstream under that exact UUID
+  -- a fresh `Pkg.instantiate()` with no special handling would silently
+  resolve to *that* instead of what `bindings/` actually builds. The
+  `docs` job does **not** need this: it only extracts docstrings
+  (`using RocksDB` succeeds against either JLL version; nothing calls
+  into the library), and doctests are intentionally absent since every
+  example is a plain ` ```julia ` fence, not ` ```jldoctest `.
+
+## Documentation (`docs/`)
+
+Every public Tier 2/Tier 3 struct and function has a docstring with a
+plain ` ```julia ` example (never ` ```jldoctest ` -- these are
+illustrative starting points, not Documenter-verified doctests, per an
+explicit request; each was still manually run once while writing it).
+Tier 1 (`RocksDB.LibRocksDB`) is deliberately excluded from the docs
+build's "missing docstrings" enforcement
+(`checkdocs_ignored_modules=[RocksDB.LibRocksDB]` in `docs/make.jl`) --
+Clang.jl's doxygen-comment extraction gives some of its ~1049 functions
+incidental docstrings, but Tier 1 is the escape hatch, not meant to be
+curated function-by-function.
+
+`docs/src/` layout: `index.md` (landing page) -> `tutorials/` (seven
+pages, in nav order: getting started, compression, iteration, batches,
+column families, snapshots, then a dedicated "mixing Tier 2 and Tier 3"
+page covering drop-down/lift-up/combined patterns -- the user asked for
+this discussion "above all else") -> `reference/tier2.md` and
+`reference/tier3.md` (curated `@docs` blocks grouped by theme, not a
+blanket `@autodocs` dump). Build with `julia --project=docs docs/make.jl`;
+run `Pkg.develop(path=".")` in the `docs` environment first if
+`RocksDB` isn't resolvable there.
+
+Two things that bit this specific setup, worth knowing before editing
+further:
+- **Heading-slug collisions**: `@ref` resolves a bare heading name
+  site-wide, so two pages both titled e.g. "Snapshots" is an error, not a
+  warning. Reference-page section headings that echo a tutorial's title
+  need to read differently (e.g. "Point-in-time reads (`Snapshot`)").
+- **`@docs` entries for a function with more than one docstring split
+  across the two reference pages** (e.g. `create_column_family`, one
+  method on `DB` for Tier 2 and one on `ColumnFamilies` for Tier 3) need
+  the *exact* method signature, type parameters and `where` clause
+  included, or the docstring silently isn't picked up (caught by the
+  build's "N docstrings not included in the manual" error, not a crash).
+
+Writing the "mixing tiers" tutorial is what surfaced the `property`/
+`length` column-family-scoping bug documented above -- exercising
+multi-column-family Tier 3 dicts in a realistic combined example is what
+existing tests hadn't done.
