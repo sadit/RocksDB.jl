@@ -2,5 +2,7 @@ using RocksDB
 using Test
 
 @testset "RocksDB.jl" begin
-    # Write your tests here.
+    include("test_lowlevel.jl")
+    include("test_midlevel.jl")
+    include("test_dict.jl")
 end

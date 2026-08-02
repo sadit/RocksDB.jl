@@ -4,3 +4,7 @@
 /Manifest*.toml
 /docs/Manifest*.toml
 /docs/build/
+
+# Editor/preview-generated rendering artifacts, not source
+/README.html
+/README_files/
