@@ -22,3 +22,9 @@ updates:
     #   julia-dependencies:
     #     patterns:
     #       - "*"
+    ignore:
+      # RocksDB_jll's UUID is deterministic and already registered upstream
+      # under an older, less complete build (see CLAUDE.md); this repo
+      # intentionally depends on a locally-built, Pkg.develop-ed version
+      # from bindings/, not whatever Dependabot finds in the registry.
+      - dependency-name: "RocksDB_jll"
