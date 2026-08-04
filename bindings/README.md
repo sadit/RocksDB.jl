@@ -13,8 +13,10 @@ from source and packages it as a Julia JLL artifact (`RocksDB_jll`).
 - io_uring (`WITH_LIBURING`) on Linux, for RocksDB's faster async I/O backend.
 - Intel TBB, NUMA, and the sanitizer build variants (ASAN/TSAN/UBSAN) are
   **not** enabled -- left as documented future extensions (see below).
-- Windows is excluded from the default platform list: Liburing_jll and
-  RocksDB's own Windows CMake path aren't exercised here.
+- Windows and ARM (aarch64) are both in the default platform list and have
+  been locally build-tested end to end (see "Windows and ARM support"
+  below); liburing stays Linux-only, both via the script's `${target}` check
+  and via `Liburing_jll`'s own `platforms=linux_platforms` restriction.
 
 ### jemalloc was tried and reverted
 
@@ -37,6 +39,45 @@ jemalloc with a symbol prefix and auditing every RocksDB call site that
 might cross the same boundary) -- out of scope here; `jemalloc_jll` was
 removed from `dependencies` accordingly.
 
+## Windows and ARM support
+
+Both were locally build-tested (`--deploy=local`, host-native emulation via
+BinaryBuilder's cross-toolchain shards) ahead of Yggdrasil submission:
+
+- **ARM (aarch64-linux-gnu)** needed **no changes at all**. The historical
+  Yggdrasil `arm64.patch` for older RocksDB versions forces
+  `util/crc32c_arm64.cc` to always compile, bypassing a `HAS_ARMV8_CRC`
+  `CHECK_C_COMPILER_FLAG` detection that supposedly didn't work reliably
+  under cross-compilation on old RocksDB/CMake combinations. That detection
+  works correctly under cross-compilation as of RocksDB v11.1.2/CMake used
+  here -- the aarch64 build compiled, linked, passed BinaryBuilder's audit,
+  and packaged cleanly with the recipe unmodified. 32-bit ARM (`armv7l`,
+  `armv6l`) is still filtered out; RocksDB targets 64-bit platforms.
+- **Windows (x86_64-w64-mingw32)** needed two fixes, both applied in
+  `build_tarballs.jl`:
+  1. `-DROCKSDB_INSTALL_ON_WINDOWS=1`. RocksDB's `CMakeLists.txt` gates its
+     entire `install()` ruleset behind
+     `if(NOT WIN32 OR ROCKSDB_INSTALL_ON_WINDOWS)`, and that option defaults
+     `OFF` -- without it, `cmake --install .` on Windows is a **silent
+     no-op** (the build itself succeeds, `cmake --build` produces the DLL,
+     but nothing gets copied into `${prefix}`, so the result is an empty
+     tarball). Confirmed by reproducing the no-op locally before adding the
+     flag.
+  2. `LibraryProduct(["librocksdb", "librocksdb-shared"], :librocksdb)`.
+     RocksDB's `CMakeLists.txt` only applies `OUTPUT_NAME "rocksdb"` to the
+     shared-lib target in its non-Windows (`else()`) branch; on Windows the
+     target keeps its literal CMake target name `rocksdb-shared`, so the
+     installed file is `librocksdb-shared.dll`, not `librocksdb.dll`. Without
+     the second name, BinaryBuilder's product audit reports `librocksdb`
+     "unsatisfied" even though the DLL built and installed correctly.
+     `LibraryProduct` accepting multiple candidate names is the standard
+     BinaryBuilder mechanism for a library that's named differently per
+     platform -- no upstream CMake patch needed.
+  MinGW (not MSVC) is the target; RocksDB's Windows port code
+  (`port/win/*.cc`) has genuine non-MSVC-gated branches (plain `if(WIN32)`,
+  explicit `if(MINGW)`), which is why MinGW cross-compilation works at all
+  here.
+
 ## Relationship to the existing `RocksDB_jll.jl`
 
 An official `RocksDB_jll.jl` already exists
@@ -53,19 +94,32 @@ here is uploaded or registered anywhere.
 
 BinaryBuilder supports building for a single host platform and writing the
 resulting JLL wrapper straight to `~/.julia/dev/` (no GitHub release, no
-registry) via `--deploy=local`. From this directory:
+registry) via `--deploy=local`. This project's `Manifest.toml` is pinned to
+Julia 1.10 (BinaryBuilder/Pkg-internals compatibility; see `CLAUDE.md`), so
+build with a specific `+1.10` juliaup channel rather than whatever `julia`
+happens to default to -- if your default Julia is a different minor version,
+`Pkg.instantiate()` will otherwise either fail outright (unresolvable compat)
+or silently re-resolve the manifest against the wrong version and then fail
+deep inside a `using BinaryBuilder` precompile with a confusing
+`ArgumentError: Package ... is required but does not seem to be installed`.
+From this directory:
 
 ```bash
-julia --project=. -e 'import Pkg; Pkg.instantiate()'
-julia --project=. build_tarballs.jl --verbose --deploy=local x86_64-linux-gnu-cxx11
+julia +1.10 --project=. -e 'import Pkg; Pkg.instantiate()'
+julia +1.10 --project=. build_tarballs.jl --verbose --deploy=local x86_64-linux-gnu-cxx11
 ```
 
-Adjust the platform triplet to your host (`julia --project=. build_tarballs.jl --help`
+Adjust the platform triplet to your host (`julia +1.10 --project=. build_tarballs.jl --help`
 explains the triplet syntax; `supported_platforms()` in a Julia REPL with
-BinaryBuilder loaded lists everything the recipe covers). This produces a
-`RocksDB_jll` package at `~/.julia/dev/RocksDB_jll` that the `RocksDB.jl`
-package in the parent directory is `Pkg.develop`-ed against for now, in place
-of the (older, less complete) registered one.
+BinaryBuilder loaded lists everything the recipe covers). Run **one platform
+at a time** -- concurrent `--deploy=local` invocations against this same
+`bindings/` environment race on Julia's precompilation lock/pidfiles and can
+leave dependencies (observed: `MbedTLS_jll`) in a broken, only-partially-
+installed state; if that happens, `julia +1.10 --project=. -e 'using Pkg;
+Pkg.instantiate()'` again resolves it. This produces a `RocksDB_jll` package
+at `~/.julia/dev/RocksDB_jll` that the `RocksDB.jl` package in the parent
+directory is `Pkg.develop`-ed against for now, in place of the (older, less
+complete) registered one.
 
 If the build fails on your GCC/toolchain combination, note that RocksDB
 11.x requires C++20 (`using enum`, added in GCC 11); this recipe pins

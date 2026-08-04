@@ -37,6 +37,14 @@ CMAKE_FLAGS=(
     -DWITH_ZSTD=1
 )
 
+# RocksDB's CMakeLists.txt gates its entire install() ruleset behind
+# `if(NOT WIN32 OR ROCKSDB_INSTALL_ON_WINDOWS)`, and ROCKSDB_INSTALL_ON_WINDOWS
+# defaults OFF -- without this, `cmake --install .` is a silent no-op on
+# Windows and the resulting tarball is empty.
+if [[ "${target}" == *mingw* ]]; then
+    CMAKE_FLAGS+=(-DROCKSDB_INSTALL_ON_WINDOWS=1)
+fi
+
 # jemalloc (WITH_JEMALLOC) was tried and deliberately left disabled: RocksDB's
 # env/io_posix.cc calls glibc's getline() (which allocates via glibc malloc)
 # and then free()s that buffer through a macro that redefines free() to
@@ -63,19 +71,24 @@ install_license ../LICENSE.Apache ../LICENSE.leveldb ../COPYING
 """
 
 # These are the platforms we will build for by default, unless further
-# platforms are passed in on the command line. Windows is excluded because
-# Liburing_jll (and RocksDB's own Windows CMake support) is not reliably
-# available/tested there.
+# platforms are passed in on the command line. 32-bit ARM is excluded (RocksDB
+# targets 64-bit platforms); Windows is included -- liburing stays Linux-only
+# below, both via the script's `${target}` check and via the Dependency's own
+# `platforms=linux_platforms` restriction.
 platforms = supported_platforms()
 platforms = expand_cxxstring_abis(platforms)
 filter!(p -> arch(p) ∉ ("armv7l", "armv6l"), platforms)
-filter!(!Sys.iswindows, platforms)
 
 linux_platforms = filter(Sys.islinux, platforms)
 
-# The products that we will ensure are always built
+# The products that we will ensure are always built.
+# On Windows, RocksDB's CMakeLists.txt only applies `OUTPUT_NAME "rocksdb"` to
+# the shared-lib target in its non-Windows branch; on Windows the target keeps
+# its literal CMake target name `rocksdb-shared`, producing
+# `librocksdb-shared.dll` instead of `librocksdb.dll`. Give both names so the
+# product check succeeds on every platform without patching upstream CMake.
 products = [
-    LibraryProduct("librocksdb", :librocksdb),
+    LibraryProduct(["librocksdb", "librocksdb-shared"], :librocksdb),
 ]
 
 # Dependencies that must be installed before this package can be built.

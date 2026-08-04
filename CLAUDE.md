@@ -29,6 +29,22 @@ All code/docs are in English. License is MIT throughout (see `LICENSE`).
 - Requires `preferred_gcc_version=v"12"` -- RocksDB 11.x uses C++20's
   `using enum`, which needs GCC >= 11; GCC 10 (BinaryBuilder's usual default)
   fails to compile it. If you bump the RocksDB version again, re-check this.
+- **Windows and ARM are enabled and locally build-tested** (not just
+  present in `platforms` -- actually run through `--deploy=local` end to
+  end). ARM (aarch64-linux-gnu) needed no changes: the old Yggdrasil
+  `arm64.patch` that force-enables `crc32c_arm64.cc` isn't needed for
+  v11.1.2, `HAS_ARMV8_CRC`'s `CHECK_C_COMPILER_FLAG` detection works fine
+  under cross-compilation. Windows (x86_64-w64-mingw32) needed two fixes:
+  `-DROCKSDB_INSTALL_ON_WINDOWS=1` (RocksDB's CMake gates its whole
+  `install()` step behind `if(NOT WIN32 OR ROCKSDB_INSTALL_ON_WINDOWS)`,
+  default `OFF` -- without it `cmake --install .` silently no-ops on
+  Windows, build succeeds but the tarball ends up empty), and
+  `LibraryProduct(["librocksdb", "librocksdb-shared"], :librocksdb)`
+  (RocksDB's CMake only renames the shared-lib target to `rocksdb` on
+  non-Windows; on Windows it keeps the literal target name `rocksdb-shared`,
+  so the DLL is `librocksdb-shared.dll` -- giving `LibraryProduct` both
+  names is the standard BinaryBuilder fix, no CMake patch needed). Full
+  writeup in `bindings/README.md`'s "Windows and ARM support" section.
 - **`RocksDB_jll.jl` already exists upstream**
   (`JuliaBinaryWrappers/RocksDB_jll.jl`, from
   `Yggdrasil/R/RocksDB/build_tarballs.jl`, RocksDB 8.9.1, only
@@ -40,6 +56,27 @@ All code/docs are in English. License is MIT throughout (see `LICENSE`).
   `julia --project=bindings bindings/build_tarballs.jl --verbose --deploy=local <triplet>`,
   which writes a local `RocksDB_jll` package straight to `~/.julia/dev/`
   (no GitHub release, no registry).
+
+## `bindings/` must be run under Julia 1.10 specifically
+
+`bindings/Manifest.toml` is pinned to Julia 1.10.11 -- BinaryBuilder/Pkg
+internals are sensitive to the exact Julia version (CI hit this too: `pre`/
+nightly Julia fails deep in BinaryBuilder with `MethodError: no method
+matching registry_info(::Pkg.Registry.PkgEntry)`, which is why CI's bindings
+build step pins a stable Julia setup independent of the test matrix's own
+version -- see `.github/workflows/CI.yml`). If the machine's juliaup default
+has since moved to a
+newer channel (it did mid-session: 1.10 -> 1.12), running plain `julia
+--project=bindings ...` doesn't error cleanly -- `Pkg.instantiate()` warns
+about the manifest/Julia mismatch and can leave dependencies (observed:
+`MbedTLS_jll`) half-installed, which then surfaces much later as a confusing
+`ArgumentError: Package ... is required but does not seem to be installed`
+buried inside a `using BinaryBuilder` precompile. Always invoke as `julia
++1.10 --project=bindings ...` (juliaup channel selector) for anything in
+this directory, and re-run `Pkg.instantiate()` under `+1.10` if you ever hit
+that error. Separately: running two `--deploy=local` builds concurrently
+against this same environment races on Julia's own precompilation
+lock/pidfiles and corrupts the same way -- build one platform at a time.
 
 ## Temporary dependency arrangement
 
