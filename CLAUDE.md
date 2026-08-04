@@ -45,6 +45,19 @@ All code/docs are in English. License is MIT throughout (see `LICENSE`).
   so the DLL is `librocksdb-shared.dll` -- giving `LibraryProduct` both
   names is the standard BinaryBuilder fix, no CMake patch needed). Full
   writeup in `bindings/README.md`'s "Windows and ARM support" section.
+- **powerpc64le and riscv64 build RocksDB fine but skip `WITH_LIBURING`**
+  -- found via Yggdrasil CI on
+  [PR #14353](https://github.com/JuliaPackaging/Yggdrasil/pull/14353), not
+  local testing (no toolchain for either locally). RocksDB itself compiles
+  cleanly on both; only the final link against `Liburing_jll`'s static
+  archive fails -- powerpc64le with `ld: final link failed: bad value`
+  (PLT call stub missing the ELFv2 ABI's trailing `nop` needed to restore
+  the TOC register), riscv64 with an explicit `recompile with -fPIC`
+  relocation error. This is a `Liburing_jll` packaging gap on those two
+  architectures, not a RocksDB or recipe issue, so `WITH_LIBURING` is
+  skipped there the same way it already is on non-Linux platforms (both
+  the script's `${target}` check and `linux_platforms`) -- the platforms
+  themselves stay enabled.
 - **`RocksDB_jll.jl` already exists upstream**
   (`JuliaBinaryWrappers/RocksDB_jll.jl`, from
   `Yggdrasil/R/RocksDB/build_tarballs.jl`, RocksDB 8.9.1, only

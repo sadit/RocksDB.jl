@@ -78,6 +78,21 @@ BinaryBuilder's cross-toolchain shards) ahead of Yggdrasil submission:
   explicit `if(MINGW)`), which is why MinGW cross-compilation works at all
   here.
 
+Submitting this recipe to [Yggdrasil](https://github.com/JuliaPackaging/Yggdrasil/pull/14353)
+surfaced one more platform-specific issue that local testing couldn't have
+caught (no powerpc64le/riscv64 toolchain available locally): `WITH_LIBURING=1`
+fails to *link* on both, even though RocksDB itself compiles cleanly on
+each. `Liburing_jll`'s static archive isn't safely embeddable in a shared
+library on either architecture -- powerpc64le fails with `ld: final link
+failed: bad value` (a PLT call stub missing the trailing `nop` the ELFv2 ABI
+needs to restore the TOC register), riscv64 fails outright with `relocation
+... can not be used when making a shared object; recompile with -fPIC`. This
+is a `Liburing_jll` packaging gap, not a RocksDB or recipe problem, so the
+fix is narrow: `WITH_LIBURING` is now also skipped on `powerpc64le`/`riscv64`
+(both the script's `${target}` check and `linux_platforms`), the same way
+it's already skipped on non-Linux platforms -- the platforms themselves stay
+enabled, just without io_uring.
+
 ## Relationship to the existing `RocksDB_jll.jl`
 
 An official `RocksDB_jll.jl` already exists
