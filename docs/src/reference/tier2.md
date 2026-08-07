@@ -85,3 +85,23 @@ Snapshot
 ```@docs
 property
 ```
+
+## Compaction (`compact!`)
+
+```@docs
+compact!
+```
+
+## Backups (`BackupEngine`)
+
+```@docs
+BackupEngine
+BackupEngine(::Function, ::AbstractString)
+BackupInfo
+create_backup!
+backup_info
+verify_backup
+purge_old_backups!
+restore_backup!
+restore_latest_backup!
+```

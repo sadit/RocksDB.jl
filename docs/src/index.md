@@ -16,19 +16,21 @@ control you need:
 
 1. **`RocksDB.LibRocksDB`** -- near-direct, auto-generated `ccall`
    wrappers over RocksDB's entire C API. Anything the C API can do, this
-   can do; it's the escape hatch, not meant for everyday use.
+   can do; it's the escape hatch, not meant for everyday use -- see
+   [Tier 1 Escape Hatch](@ref) for how and when to drop down to it.
 2. **Tier 2** ([`opendb`](@ref), [`DB`](@ref), [`put!`](@ref)/[`get`](@ref)/
    [`delete!`](@ref), [`WriteBatch`](@ref), [`DBIterator`](@ref),
-   [`Snapshot`](@ref), ...) -- idiomatic Julia wrappers with sensible
-   defaults, for everyday use.
+   [`Snapshot`](@ref), [`BackupEngine`](@ref), [`compact!`](@ref), ...) --
+   idiomatic Julia wrappers with sensible defaults, for everyday use.
 3. **Tier 3** ([`RocksDBDict`](@ref), [`ColumnFamilies`](@ref),
    [`RocksDBSnapshotView`](@ref)) -- an `AbstractDict`-like facade with
    compression/cache/environment knobs surfaced directly in the
    constructor, atomic batch writes, column families as dict-like
    sub-namespaces, and read-only point-in-time snapshot views.
 
-The two levels aren't an either/or choice -- see
-[Mixing Tier 2 and Tier 3](@ref) for how to combine them.
+The tiers aren't an either/or choice -- see [Mixing Tier 2 and Tier 3](@ref)
+for how to combine Tier 2 and Tier 3, and [Tier 1 Escape Hatch](@ref) for
+Tier 1 and Tier 2.
 
 ## Where to start
 
@@ -39,8 +41,12 @@ New to the package? Start with the tutorials, in order:
 3. [Iteration and Range Scans](@ref)
 4. [Write Batches](@ref)
 5. [Column Families](@ref)
-6. [Snapshots](@ref)
-7. [Mixing Tier 2 and Tier 3](@ref)
+6. [TTL Databases](@ref)
+7. [Compaction](@ref)
+8. [Snapshots](@ref)
+9. [Backups](@ref)
+10. [Tier 1 Escape Hatch](@ref)
+11. [Mixing Tier 2 and Tier 3](@ref)
 
 Already know what you're looking for? Jump to the
 [Tier 2 API Reference](@ref) or [Tier 3 API Reference](@ref).

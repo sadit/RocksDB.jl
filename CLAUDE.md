@@ -209,6 +209,76 @@ update this note.
    (`setindex!`/`delete!`/`empty!`) throw a clear `ErrorException` rather
    than a generic `MethodError`.
 
+   `RocksDB.BackupEngine` (Tier 2, `src/midlevel.jl`) wraps RocksDB's
+   backup engine (`rocksdb_backup_engine_*`), which until this was added
+   was a genuine Tier 1 hole -- the running example in the new
+   `tier1_escape_hatch.md` tutorial. Same shape as `Env`/`Snapshot`: a
+   `ptr` field, a finalizer that destroys-then-nulls, and a `do`-block
+   form. Two intermediate C option structs
+   (`rocksdb_backup_engine_options_t`, `rocksdb_restore_options_t`) are
+   deliberately **not** exposed as their own public Julia types -- they're
+   created, configured from keyword arguments, used, and destroyed
+   entirely inside `BackupEngine`'s constructor and
+   `restore_backup!`/`restore_latest_backup!` respectively, same criterion
+   `Options` already uses for not exposing `Cache`/`FilterPolicy` as
+   structs the caller must assemble by hand in the common case. One real
+   bug caught before landing: `rocksdb_backup_engine_open_opts`'s `env`
+   parameter is **not** optional the way `Options`' `env` keyword is --
+   the C++ implementation dereferences it unconditionally, so passing
+   `C_NULL` (when the user doesn't supply an `Env`) segfaults immediately
+   on `DB::Open`-adjacent code paths. Fixed by always constructing a
+   fallback `Env()` internally when none is given, and storing it in a
+   `BackupEngine.env` field purely for GC reachability (never explicitly
+   destroyed by `BackupEngine` itself) -- the same "hold a Julia reference
+   so GC ordering keeps the dependency alive" pattern `Options.env` already
+   uses. Naming follows existing convention: `create_backup!`,
+   `purge_old_backups!`, `restore_backup!`, `restore_latest_backup!` get
+   `!` because they mutate the filesystem (the restore functions can
+   overwrite an existing `db_dir`); `backup_info` and `verify_backup` don't,
+   since they only read/validate.
+
+   TTL support is just a new `ttl` keyword on `opendb` (`src/midlevel.jl`)
+   -- no new struct, no new export. `ttl === nothing` skips every new
+   branch, so the no-TTL path is untouched. Backed by
+   `rocksdb_open_with_ttl`/`rocksdb_open_column_families_with_ttl`
+   (`DBWithTTL`, a `StackableDB`, so every other Tier 2/3 function keeps
+   working unmodified on the returned `rocksdb_t*`) -- deliberately
+   **not** the other RocksDB TTL mechanism,
+   `rocksdb_options_set_ttl`/`ColumnFamilyOptions::ttl`, which is a
+   weaker, compaction-only hint rather than an actual expiring-database
+   open mode. Two things worth knowing if this gets touched again:
+   - **Expiry is compaction-only, not read-time**, straight from
+     `rocksdb/utilities/db_ttl.h`'s own comment: "Get/Iterator may return
+     expired entries (compaction not run on them yet)". First draft of
+     this feature's tests assumed read-time filtering (it doesn't) and
+     were flaky/wrong until rewritten to force a manual compaction after
+     the TTL elapses (originally a raw `rocksdb_compact_range`/`_cf` call,
+     now `compact!` -- see below) -- don't reintroduce a test that sleeps
+     past `ttl` and asserts on `get` directly, without compacting first.
+   - `read_only` + `ttl` throws `ArgumentError` before touching the C
+     API: `rocksdb_open_with_ttl`/`_column_families_with_ttl` have no
+     `read_only` parameter, even though `DBWithTTL::Open` in C++ does --
+     the C API just doesn't expose it.
+   - `rocksdb_create_column_family_with_ttl` (adding a TTL'd column
+     family to an already-open TTL database) is **not** wrapped --
+     RocksDB's implementation does an unchecked `static_cast<DBWithTTL*>`
+     on the `rocksdb_t*`, which is undefined behavior if `db` wasn't
+     opened via one of the `*_with_ttl` functions. Tier 2 has no way to
+     know at the Julia level whether a given `DB` was opened with TTL, so
+     wrapping this safely would need `DB` to track that itself first.
+
+   `compact!` (Tier 2, `src/midlevel.jl`, right after `property`) wraps
+   manual compaction (`rocksdb_compact_range`/`_cf`, and the `_opt`/
+   `_cf_opt` variants plus a throwaway `rocksdb_compactoptions_t` only
+   when at least one of `exclusive`/`change_level`/`target_level`/
+   `bottommost_level_compaction`/`max_subcompactions` is given -- same
+   "don't build the options struct unless asked" shape as `WriteOptions`/
+   `ReadOptions` elsewhere). It replaced a raw
+   `RocksDB.LibRocksDB.rocksdb_compact_range` call the TTL tutorial and
+   `opendb`'s `ttl` docstring were temporarily using as their "force
+   expiry now" illustration -- both now use `compact!` instead. No new
+   struct beyond the function itself.
+
 ## Suggested follow-ups (not yet implemented)
 
 - `ColumnFamily` handles (`src/midlevel.jl`) are never destroyed --
@@ -216,6 +286,18 @@ update this note.
   while auditing finalizers for the snapshot-view work; a real (small)
   resource leak, out of scope for that change.
 - TBB/NUMA/sanitizer build variants in `bindings/`, if ever needed.
+- **Encryption at rest**: RocksDB's plain C API (`rocksdb/c.h`, what
+  Tier 1 is generated from) has no function to create an encrypted `Env`
+  -- `NewEncryptedEnv` lives only in the C++-only `env_encryption.h`
+  (confirmed absent from both `gen/rocksdb_headers/rocksdb/c.h` and the
+  locally built artifact's installed headers). Supporting it would mean
+  writing a small `extern "C"` shim exposing `NewEncryptedEnv` and adding
+  it to `bindings/build_tarballs.jl` -- real new C++ code in the binding
+  recipe, not just a Tier 2 wrapper over an existing C function like
+  everything else in this package so far.
+- `rocksdb_create_column_family_with_ttl` -- see the TTL note above under
+  Tier 2; needs `DB` to track whether it was opened with TTL before it
+  can be wrapped safely.
 
 ## Testing
 
@@ -248,15 +330,19 @@ Clang.jl's doxygen-comment extraction gives some of its ~1049 functions
 incidental docstrings, but Tier 1 is the escape hatch, not meant to be
 curated function-by-function.
 
-`docs/src/` layout: `index.md` (landing page) -> `tutorials/` (seven
+`docs/src/` layout: `index.md` (landing page) -> `tutorials/` (eleven
 pages, in nav order: getting started, compression, iteration, batches,
-column families, snapshots, then a dedicated "mixing Tier 2 and Tier 3"
-page covering drop-down/lift-up/combined patterns -- the user asked for
-this discussion "above all else") -> `reference/tier2.md` and
-`reference/tier3.md` (curated `@docs` blocks grouped by theme, not a
-blanket `@autodocs` dump). Build with `julia --project=docs docs/make.jl`;
-run `Pkg.develop(path=".")` in the `docs` environment first if
-`RocksDB` isn't resolvable there.
+column families, TTL databases, compaction, snapshots, backups, a
+dedicated "Tier 1 Escape Hatch" page (Tier 1 <-> Tier 2, using `BackupEngine` as the
+"here's what moving something out of Tier 1 buys you" example and
+RocksDB checkpoints -- still unwrapped -- as the live drop-to-Tier-1
+example), then a dedicated "mixing Tier 2 and Tier 3" page covering
+drop-down/lift-up/combined patterns -- the user asked for this discussion
+"above all else") ->
+`reference/tier2.md` and `reference/tier3.md` (curated `@docs` blocks
+grouped by theme, not a blanket `@autodocs` dump). Build with
+`julia --project=docs docs/make.jl`; run `Pkg.develop(path=".")` in the
+`docs` environment first if `RocksDB` isn't resolvable there.
 
 Two things that bit this specific setup, worth knowing before editing
 further:

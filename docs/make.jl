@@ -22,7 +22,11 @@ makedocs(;
             "tutorials/iteration.md",
             "tutorials/batches.md",
             "tutorials/column_families.md",
+            "tutorials/ttl.md",
+            "tutorials/compaction.md",
             "tutorials/snapshots.md",
+            "tutorials/backups.md",
+            "tutorials/tier1_escape_hatch.md",
             "tutorials/mixing_tiers.md",
         ],
         "API Reference" => [

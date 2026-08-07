@@ -442,18 +442,46 @@ pass `options` yourself). Pass `read_only=true` to open an existing
 database without acquiring the (exclusive) write lock -- useful for
 inspecting a database another process still has open for writing.
 
+Pass `ttl` to open a database whose entries expire after roughly that many
+seconds. Either a single number of seconds (applied to `"default"`, or to
+every column family if `column_families` is given), or (only together
+with `column_families`) a vector of per-column-family TTLs, same length
+and order as `column_families`. `read_only` cannot be combined with `ttl`
+-- RocksDB's C API has no such combination.
+
+Expiry is enforced **only during compaction**, not on every read: `get`
+and iteration can still return an entry after its TTL has elapsed, until
+some compaction happens to run over it (RocksDB makes no promise about
+when that is -- non-positive/absent `ttl` means "never expires", not "as
+soon as possible"). Force it deterministically with [`compact!`](@ref) if
+you need to observe expiry without waiting for a background compaction.
+
+A database ever opened with `ttl` must always be reopened with `ttl` (any
+value, even a different one -- RocksDB allows changing it across opens)
+afterwards: entries carry a hidden 4-byte timestamp that a `ttl`-less open
+would otherwise expose as if it were part of the value.
+
 The `do`-block form guarantees the database is closed even if an
 exception is thrown.
 """
 function opendb(path::AbstractString; options::Union{Nothing,Options} = nothing,
               column_families::Union{Nothing,Vector{<:AbstractString}} = nothing,
-              read_only::Bool = false, kwargs...)
+              read_only::Bool = false,
+              ttl::Union{Nothing,Integer,AbstractVector{<:Integer}} = nothing,
+              kwargs...)
     opts = options === nothing ? Options(; kwargs...) : options
 
+    read_only && ttl !== nothing &&
+        throw(ArgumentError("read_only cannot be combined with ttl -- RocksDB has no such open mode"))
+
     if column_families === nothing
+        ttl isa AbstractVector &&
+            throw(ArgumentError("a vector of ttl values requires column_families"))
         dbptr = checked() do errptr
             if read_only
                 Lib.rocksdb_open_for_read_only(opts.ptr, path, false, errptr)
+            elseif ttl !== nothing
+                Lib.rocksdb_open_with_ttl(opts.ptr, path, Cint(ttl), errptr)
             else
                 Lib.rocksdb_open(opts.ptr, path, errptr)
             end
@@ -465,11 +493,21 @@ function opendb(path::AbstractString; options::Union{Nothing,Options} = nothing,
         name_ptrs = [Ptr{Cchar}(pointer(nm)) for nm in names]
         cf_opts_ptrs = fill(opts.ptr, n)
         cf_handles = Vector{Ptr{Lib.rocksdb_column_family_handle_t}}(undef, n)
+        if ttl !== nothing
+            ttls = ttl isa AbstractVector ? Vector{Cint}(ttl) : fill(Cint(ttl), n)
+            length(ttls) == n ||
+                throw(ArgumentError("ttl has $(length(ttls)) entries but column_families has $n"))
+        end
         dbptr = GC.@preserve names checked() do errptr
             if read_only
                 Lib.rocksdb_open_for_read_only_column_families(
                     opts.ptr, path, Cint(n),
                     pointer(name_ptrs), pointer(cf_opts_ptrs), pointer(cf_handles), false, errptr,
+                )
+            elseif ttl !== nothing
+                Lib.rocksdb_open_column_families_with_ttl(
+                    opts.ptr, path, Cint(n),
+                    pointer(name_ptrs), pointer(cf_opts_ptrs), pointer(cf_handles), pointer(ttls), errptr,
                 )
             else
                 Lib.rocksdb_open_column_families(
@@ -995,4 +1033,389 @@ function property(db::DB, name::AbstractString; cf::Union{Nothing,ColumnFamily,A
     s = unsafe_string(p)
     Lib.rocksdb_free(p)
     return s
+end
+
+# ------------------------------------------------------------------------
+# Compaction
+# ------------------------------------------------------------------------
+
+_range_bytes(x::Nothing) = (nothing, Ptr{Cchar}(C_NULL), Csize_t(0))
+function _range_bytes(x)
+    b = _bytes(x)
+    return (b, Ptr{Cchar}(pointer(b)), Csize_t(length(b)))
+end
+
+"""
+    compact!(db; cf=nothing, from=nothing, to=nothing, exclusive=nothing,
+             change_level=nothing, target_level=nothing,
+             bottommost_level_compaction=nothing, max_subcompactions=nothing)
+
+Force a manual compaction over `[from, to]` (both `nothing` means the
+whole key range), scoped to `cf` (`nothing` meaning the default column
+family, as elsewhere in this package). Useful whenever you need
+compaction-driven effects to happen now rather than whenever RocksDB
+would otherwise get to them -- most notably to observe [`opendb`](@ref)'s
+`ttl` option actually remove expired entries, since expiry is enforced
+only during compaction.
+
+The keyword arguments besides `cf`/`from`/`to` map directly to RocksDB's
+`CompactRangeOptions` and are only built into one (at a small extra cost)
+if any of them is given; leave them all `nothing` for the common case.
+
+```julia
+db = RocksDB.opendb(mktempdir() * "/mydb"; ttl = 1)
+put!(db, "a", "1")
+sleep(2)
+compact!(db)
+get(db, "a")   # nothing -- expired and swept by the compaction
+close(db)
+```
+"""
+function compact!(db::DB; cf::Union{Nothing,ColumnFamily,AbstractString} = nothing,
+                   from = nothing, to = nothing,
+                   exclusive::Union{Nothing,Bool} = nothing,
+                   change_level::Union{Nothing,Bool} = nothing,
+                   target_level::Union{Nothing,Integer} = nothing,
+                   bottommost_level_compaction::Union{Nothing,Bool} = nothing,
+                   max_subcompactions::Union{Nothing,Integer} = nothing)
+    from_bytes, from_ptr, from_len = _range_bytes(from)
+    to_bytes, to_ptr, to_len = _range_bytes(to)
+    cf_ptr = cf === nothing ? C_NULL : _cf_ptr(db, cf)
+
+    if exclusive === nothing && change_level === nothing && target_level === nothing &&
+       bottommost_level_compaction === nothing && max_subcompactions === nothing
+        GC.@preserve from_bytes to_bytes begin
+            if cf === nothing
+                Lib.rocksdb_compact_range(db.ptr, from_ptr, from_len, to_ptr, to_len)
+            else
+                Lib.rocksdb_compact_range_cf(db.ptr, cf_ptr, from_ptr, from_len, to_ptr, to_len)
+            end
+        end
+    else
+        opt = Lib.rocksdb_compactoptions_create()
+        try
+            exclusive !== nothing &&
+                Lib.rocksdb_compactoptions_set_exclusive_manual_compaction(opt, Cuchar(exclusive))
+            change_level !== nothing &&
+                Lib.rocksdb_compactoptions_set_change_level(opt, Cuchar(change_level))
+            target_level !== nothing &&
+                Lib.rocksdb_compactoptions_set_target_level(opt, Cint(target_level))
+            bottommost_level_compaction !== nothing &&
+                Lib.rocksdb_compactoptions_set_bottommost_level_compaction(opt, Cuchar(bottommost_level_compaction))
+            max_subcompactions !== nothing &&
+                Lib.rocksdb_compactoptions_set_max_subcompactions(opt, Cint(max_subcompactions))
+            GC.@preserve from_bytes to_bytes begin
+                if cf === nothing
+                    Lib.rocksdb_compact_range_opt(db.ptr, opt, from_ptr, from_len, to_ptr, to_len)
+                else
+                    Lib.rocksdb_compact_range_cf_opt(db.ptr, cf_ptr, opt, from_ptr, from_len, to_ptr, to_len)
+                end
+            end
+        finally
+            Lib.rocksdb_compactoptions_destroy(opt)
+        end
+    end
+    return nothing
+end
+
+# ------------------------------------------------------------------------
+# Backups
+# ------------------------------------------------------------------------
+
+"""
+    BackupInfo
+
+One backup's metadata, as returned by [`backup_info`](@ref): `backup_id`,
+`timestamp` (seconds since epoch), `size` (bytes), and `num_files`.
+"""
+struct BackupInfo
+    backup_id::UInt32
+    timestamp::Int64
+    size::UInt64
+    num_files::UInt32
+end
+
+"""
+    BackupEngine(backup_dir; kwargs...)
+
+A handle to a RocksDB backup engine rooted at `backup_dir`. Construct with
+`BackupEngine`, close with `close` (or let the finalizer do it); supports
+the `do`-block form. Use [`create_backup!`](@ref) to take backups of a
+[`DB`](@ref), [`backup_info`](@ref)/[`verify_backup`](@ref) to inspect
+them, and [`restore_backup!`](@ref)/[`restore_latest_backup!`](@ref) to
+restore one back into a database directory.
+
+Keyword arguments (all optional, matching RocksDB's own defaults except
+where noted): `env` (an [`Env`](@ref) for the backup engine to use, e.g.
+one with rate-limited background threads; defaults to a fresh, plain
+[`Env`](@ref) if not given -- RocksDB's backup engine requires one, unlike
+[`opendb`](@ref) where it's optional), `share_table_files` (default
+`true`), `sync` (default `true`),
+`backup_log_files` (default `true`), `backup_rate_limit`,
+`restore_rate_limit`, `max_background_operations`,
+`max_valid_backups_to_open`, `share_files_with_checksum_naming`,
+`destroy_old_data`.
+
+# Examples
+
+```julia
+db = RocksDB.opendb(mktempdir() * "/mydb")
+put!(db, "a", "1")
+
+be = RocksDB.BackupEngine(mktempdir() * "/backups")
+create_backup!(be, db)
+close(db)
+close(be)
+```
+"""
+mutable struct BackupEngine
+    ptr::Ptr{Lib.rocksdb_backup_engine_t}
+    env::Env  # kept alive for as long as the backup engine needs it -- see constructor
+
+    function BackupEngine(backup_dir::AbstractString; env::Union{Nothing,Env} = nothing,
+                           share_table_files::Bool = true, sync::Bool = true,
+                           backup_log_files::Bool = true,
+                           backup_rate_limit::Union{Nothing,Integer} = nothing,
+                           restore_rate_limit::Union{Nothing,Integer} = nothing,
+                           max_background_operations::Union{Nothing,Integer} = nothing,
+                           max_valid_backups_to_open::Union{Nothing,Integer} = nothing,
+                           share_files_with_checksum_naming::Union{Nothing,Integer} = nothing,
+                           destroy_old_data::Union{Nothing,Bool} = nothing)
+        # RocksDB's BackupEngine::Open requires a real Env (unlike opendb's
+        # Options, where it's optional and defaults internally) -- unlike
+        # rocksdb_backup_engine_options_set_env below, which sets a
+        # *separate*, optional backup_env field, this positional env is
+        # dereferenced unconditionally by rocksdb_backup_engine_open_opts,
+        # so passing C_NULL here segfaults.
+        env_obj = env === nothing ? Env() : env
+        opts = Lib.rocksdb_backup_engine_options_create(backup_dir)
+        try
+            Lib.rocksdb_backup_engine_options_set_share_table_files(opts, Cuchar(share_table_files))
+            Lib.rocksdb_backup_engine_options_set_sync(opts, Cuchar(sync))
+            Lib.rocksdb_backup_engine_options_set_backup_log_files(opts, Cuchar(backup_log_files))
+            backup_rate_limit !== nothing &&
+                Lib.rocksdb_backup_engine_options_set_backup_rate_limit(opts, UInt64(backup_rate_limit))
+            restore_rate_limit !== nothing &&
+                Lib.rocksdb_backup_engine_options_set_restore_rate_limit(opts, UInt64(restore_rate_limit))
+            max_background_operations !== nothing &&
+                Lib.rocksdb_backup_engine_options_set_max_background_operations(opts, Cint(max_background_operations))
+            max_valid_backups_to_open !== nothing &&
+                Lib.rocksdb_backup_engine_options_set_max_valid_backups_to_open(opts, Cint(max_valid_backups_to_open))
+            share_files_with_checksum_naming !== nothing &&
+                Lib.rocksdb_backup_engine_options_set_share_files_with_checksum_naming(opts, Cint(share_files_with_checksum_naming))
+            destroy_old_data !== nothing &&
+                Lib.rocksdb_backup_engine_options_set_destroy_old_data(opts, Cuchar(destroy_old_data))
+            env !== nothing && Lib.rocksdb_backup_engine_options_set_env(opts, env_obj.ptr)
+            ptr = checked(errptr -> Lib.rocksdb_backup_engine_open_opts(opts, env_obj.ptr, errptr))
+            be = new(ptr, env_obj)
+            finalizer(be) do b
+                if b.ptr != C_NULL
+                    Lib.rocksdb_backup_engine_close(b.ptr)
+                    b.ptr = Ptr{Lib.rocksdb_backup_engine_t}(C_NULL)
+                end
+            end
+            return be
+        finally
+            Lib.rocksdb_backup_engine_options_destroy(opts)
+        end
+    end
+end
+
+Base.isopen(be::BackupEngine) = be.ptr != C_NULL
+Base.close(be::BackupEngine) = finalize(be)
+
+"""
+    BackupEngine(f, backup_dir; kwargs...)
+
+`do`-block form: opens the backup engine, runs `f`, and closes it even if
+`f` throws.
+
+```julia
+db = RocksDB.opendb(mktempdir() * "/mydb2")
+put!(db, "a", "1")
+RocksDB.BackupEngine(mktempdir() * "/backups2") do be
+    create_backup!(be, db)
+end
+close(db)
+```
+"""
+function BackupEngine(f::Function, backup_dir::AbstractString; kwargs...)
+    be = BackupEngine(backup_dir; kwargs...)
+    try
+        return f(be)
+    finally
+        close(be)
+    end
+end
+
+"""
+    create_backup!(be::BackupEngine, db::DB; flush_before_backup=false)
+
+Take a new backup of `db` into `be`'s backup directory.
+
+```julia
+db = RocksDB.opendb(mktempdir() * "/mydb3")
+put!(db, "a", "1")
+be = RocksDB.BackupEngine(mktempdir() * "/backups3")
+create_backup!(be, db)
+length(backup_info(be))   # 1
+close(db)
+close(be)
+```
+"""
+function create_backup!(be::BackupEngine, db::DB; flush_before_backup::Bool = false)
+    checked(errptr -> Lib.rocksdb_backup_engine_create_new_backup_flush(
+        be.ptr, db.ptr, Cuchar(flush_before_backup), errptr))
+    return nothing
+end
+
+"""
+    backup_info(be::BackupEngine) -> Vector{BackupInfo}
+
+The metadata ([`BackupInfo`](@ref)) of every backup currently in `be`'s
+backup directory, oldest first.
+
+```julia
+db = RocksDB.opendb(mktempdir() * "/mydb4")
+put!(db, "a", "1")
+be = RocksDB.BackupEngine(mktempdir() * "/backups4")
+create_backup!(be, db)
+infos = backup_info(be)
+infos[1].backup_id   # 1
+close(db)
+close(be)
+```
+"""
+function backup_info(be::BackupEngine)
+    info = Lib.rocksdb_backup_engine_get_backup_info(be.ptr)
+    try
+        n = Lib.rocksdb_backup_engine_info_count(info)
+        return [BackupInfo(Lib.rocksdb_backup_engine_info_backup_id(info, i),
+                            Lib.rocksdb_backup_engine_info_timestamp(info, i),
+                            Lib.rocksdb_backup_engine_info_size(info, i),
+                            Lib.rocksdb_backup_engine_info_number_files(info, i))
+                for i in 0:(n - 1)]
+    finally
+        Lib.rocksdb_backup_engine_info_destroy(info)
+    end
+end
+
+"""
+    verify_backup(be::BackupEngine, backup_id::Integer)
+
+Verify that the backup identified by `backup_id` is valid (all its files
+are present and checksums match). Throws [`RocksDBException`](@ref) if
+not; returns `nothing` on success.
+
+```julia
+db = RocksDB.opendb(mktempdir() * "/mydb5")
+put!(db, "a", "1")
+be = RocksDB.BackupEngine(mktempdir() * "/backups5")
+create_backup!(be, db)
+verify_backup(be, 1)   # nothing -- valid
+close(db)
+close(be)
+```
+"""
+function verify_backup(be::BackupEngine, backup_id::Integer)
+    checked(errptr -> Lib.rocksdb_backup_engine_verify_backup(be.ptr, UInt32(backup_id), errptr))
+    return nothing
+end
+
+"""
+    purge_old_backups!(be::BackupEngine, num_backups_to_keep::Integer)
+
+Delete all but the `num_backups_to_keep` most recent backups.
+
+```julia
+db = RocksDB.opendb(mktempdir() * "/mydb6")
+put!(db, "a", "1")
+be = RocksDB.BackupEngine(mktempdir() * "/backups6")
+create_backup!(be, db)
+put!(db, "b", "2")
+create_backup!(be, db)
+purge_old_backups!(be, 1)
+length(backup_info(be))   # 1
+close(db)
+close(be)
+```
+"""
+function purge_old_backups!(be::BackupEngine, num_backups_to_keep::Integer)
+    checked(errptr -> Lib.rocksdb_backup_engine_purge_old_backups(be.ptr, UInt32(num_backups_to_keep), errptr))
+    return nothing
+end
+
+_make_restore_options(keep_log_files::Bool) = let opt = Lib.rocksdb_restore_options_create()
+    Lib.rocksdb_restore_options_set_keep_log_files(opt, Cint(keep_log_files))
+    opt
+end
+
+"""
+    restore_backup!(be::BackupEngine, backup_id::Integer, db_dir; wal_dir=db_dir, keep_log_files=false)
+
+Restore the backup identified by `backup_id` into `db_dir` (and `wal_dir`
+for its write-ahead log), overwriting whatever is already there. Does
+**not** require a [`DB`](@ref) to already be open on `db_dir`.
+
+```julia
+src = RocksDB.opendb(mktempdir() * "/mydb7")
+put!(src, "a", "1")
+be = RocksDB.BackupEngine(mktempdir() * "/backups7")
+create_backup!(be, src)
+close(src)
+
+restored = mktempdir() * "/restored7"
+restore_backup!(be, 1, restored)
+close(be)
+
+db2 = RocksDB.opendb(restored; create_if_missing = false)
+String(get(db2, "a"))   # "1"
+close(db2)
+```
+"""
+function restore_backup!(be::BackupEngine, backup_id::Integer, db_dir::AbstractString;
+                          wal_dir::AbstractString = db_dir, keep_log_files::Bool = false)
+    opt = _make_restore_options(keep_log_files)
+    try
+        checked(errptr -> Lib.rocksdb_backup_engine_restore_db_from_backup(
+            be.ptr, db_dir, wal_dir, opt, UInt32(backup_id), errptr))
+    finally
+        Lib.rocksdb_restore_options_destroy(opt)
+    end
+    return nothing
+end
+
+"""
+    restore_latest_backup!(be::BackupEngine, db_dir; wal_dir=db_dir, keep_log_files=false)
+
+Restore the most recent backup into `db_dir` (and `wal_dir` for its
+write-ahead log), overwriting whatever is already there. Does **not**
+require a [`DB`](@ref) to already be open on `db_dir`.
+
+```julia
+src = RocksDB.opendb(mktempdir() * "/mydb8")
+put!(src, "a", "1")
+be = RocksDB.BackupEngine(mktempdir() * "/backups8")
+create_backup!(be, src)
+close(src)
+
+restored = mktempdir() * "/restored8"
+restore_latest_backup!(be, restored)
+close(be)
+
+db2 = RocksDB.opendb(restored; create_if_missing = false)
+String(get(db2, "a"))   # "1"
+close(db2)
+```
+"""
+function restore_latest_backup!(be::BackupEngine, db_dir::AbstractString;
+                                 wal_dir::AbstractString = db_dir, keep_log_files::Bool = false)
+    opt = _make_restore_options(keep_log_files)
+    try
+        checked(errptr -> Lib.rocksdb_backup_engine_restore_db_from_latest_backup(
+            be.ptr, db_dir, wal_dir, opt, errptr))
+    finally
+        Lib.rocksdb_restore_options_destroy(opt)
+    end
+    return nothing
 end
