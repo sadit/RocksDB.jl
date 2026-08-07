@@ -33,6 +33,7 @@ Yggdrasil (see [`bindings/README.md`](bindings/README.md)), develop this
 package against a locally-built JLL:
 
 ```julia
+julia --project=bindings -e 'import Pkg; Pkg.instantiate()'
 julia --project=bindings bindings/build_tarballs.jl --verbose --deploy=local x86_64-linux-gnu-cxx11
 julia --project=. -e 'import Pkg; Pkg.develop(path=joinpath(homedir(), ".julia", "dev", "RocksDB_jll"))'
 ```
