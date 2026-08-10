@@ -28,14 +28,11 @@ The package exposes RocksDB at three levels:
 
 ## Installation
 
-Not yet registered. Until the underlying `RocksDB_jll` is registered in
-Yggdrasil (see [`bindings/README.md`](bindings/README.md)), develop this
-package against a locally-built JLL:
+The package can be installed with the Julia package manager.
+From the Julia REPL, type `]` to enter the Pkg REPL mode and run:
 
 ```julia
-julia --project=bindings -e 'import Pkg; Pkg.instantiate()'
-julia --project=bindings bindings/build_tarballs.jl --verbose --deploy=local x86_64-linux-gnu-cxx11
-julia --project=. -e 'import Pkg; Pkg.develop(path=joinpath(homedir(), ".julia", "dev", "RocksDB_jll"))'
+pkg> add RocksDB
 ```
 
 ## Quick start
